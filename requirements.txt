@@ -1,0 +1,7 @@
+# requirements.txt
+
+openai-whisper
+ffmpeg
+gradio
+boto3
+ffmpeg-python
