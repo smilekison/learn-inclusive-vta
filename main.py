@@ -6,7 +6,6 @@ import gradio as gr
 import subprocess
 import shutil
 import re
-import json
 
 # Load Whisper model
 model = whisper.load_model("small")  # better accuracy
@@ -18,7 +17,17 @@ s3_client = boto3.client("s3")
 FFMPEG_FALLBACK = r"C:\\ffmpeg\\bin\\ffmpeg.exe"
 FFPROBE_FALLBACK = r"C:\\ffmpeg\\bin\\ffprobe.exe"
 
-SIGNS_DIR = "signs"
+# Simple English-to-gloss dictionary (extendable)
+GLOSS_DICT = {
+    "hello": "HELLO",
+    "welcome": "WELCOME",
+    "thankyou": "THANKYOU",
+    "thank": "THANKYOU",
+    "you": "YOU",
+    "smile": "SMILE",
+    "i": "I",
+    "am": "AM",
+}
 
 
 def get_ffmpeg_cmd():
@@ -61,123 +70,66 @@ def extract_audio(video_path, output_audio_path):
         raise RuntimeError("ffmpeg produced an empty audio file. The audio stream may be invalid.")
 
 
-def save_srt(transcription_result, srt_path):
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, segment in enumerate(transcription_result["segments"], start=1):
-            start = segment["start"]
-            end = segment["end"]
-            text = segment["text"].strip()
-            f.write(f"{i}\n")
-            f.write(f"{format_timestamp(start)} --> {format_timestamp(end)}\n")
-            f.write(f"{text}\n\n")
-
-
-def format_timestamp(seconds: float):
-    millis = int((seconds % 1) * 1000)
-    seconds = int(seconds)
-    mins, secs = divmod(seconds, 60)
-    hrs, mins = divmod(mins, 60)
-    return f"{hrs:02}:{mins:02}:{secs:02},{millis:03}"
-
-
 def normalize_word(w: str):
     return re.sub(r"[^a-zA-Z]", "", w).lower()
 
 
-def build_sign_video_from_text(text: str, segments=None, output_path="sign_output.mp4"):
-    ffmpeg_cmd = get_ffmpeg_cmd()
-    if not os.path.isdir(SIGNS_DIR):
-        return None, "<div style='color:red'>No signs directory found.</div>"
+def text_to_gloss(text: str):
+    words = text.split()
+    glosses = []
+    for w in words:
+        key = normalize_word(w)
+        if key in ("thank", "you") and "thankyou" in GLOSS_DICT:
+            glosses.append("THANKYOU")
+        elif key in GLOSS_DICT:
+            glosses.append(GLOSS_DICT[key])
+    return glosses
 
-    raw_words = text.split()
-    norm_words = [normalize_word(w) for w in raw_words if normalize_word(w)]
 
-    # handle bigrams like "thank you"
-    i = 0
-    mapped = []
-    while i < len(norm_words):
-        if i < len(norm_words) - 1:
-            bigram = norm_words[i] + norm_words[i + 1]
-            bigram_path = os.path.join(SIGNS_DIR, f"{bigram}.gif")
-            if os.path.exists(bigram_path):
-                mapped.append((bigram, bigram_path))
-                i += 2
-                continue
-        fname = os.path.join(SIGNS_DIR, f"{norm_words[i]}.gif")
-        mapped.append((norm_words[i], fname))
-        i += 1
+def build_sigml(glosses):
+    sigml_content = "<sigml>\n"
+    for g in glosses:
+        sigml_content += f"  <sign gloss=\"{g}\"/>\n"
+    sigml_content += "</sigml>"
+    return sigml_content
 
-    clips, durations, timeline = [], [], []
-    base_dur = 2.0
 
-    if segments:
-        total_duration = sum(seg["end"] - seg["start"] for seg in segments)
-        per_word = total_duration / max(1, len(mapped))
+def generate_sign_avatar(text: str):
+    glosses = text_to_gloss(text)
+    if not glosses:
+        return None, "<div style='color:red'>No glosses found for input text.</div>"
+
+    sigml_content = build_sigml(glosses)
+    sigml_file = tempfile.NamedTemporaryFile(suffix=".sigml", delete=False, mode="w", encoding="utf-8")
+    sigml_file.write(sigml_content)
+    sigml_file.close()
+
+    # For MVP: Upload to S3 (public-read) so JASigning player can access
+    bucket_name = os.environ.get("SIGN_BUCKET")
+    sigml_url = None
+    if bucket_name:
+        key = os.path.basename(sigml_file.name)
+        try:
+            s3_client.upload_file(sigml_file.name, bucket_name, key, ExtraArgs={'ACL': 'public-read'})
+            sigml_url = f"https://{bucket_name}.s3.amazonaws.com/{key}"
+        except Exception as e:
+            return None, f"<div style='color:red'>Failed to upload sigml: {e}</div>"
+
+    # Embed JASigning player iframe with sigml URL
+    if sigml_url:
+        iframe = f"""
+        <iframe src='https://vh.cmp.uea.ac.uk/player?sigml_url={sigml_url}'
+                width='400' height='400' frameborder='0'></iframe>
+        """
+        return sigml_file.name, iframe
     else:
-        per_word = base_dur
-
-    current_time = 0.0
-    for w, path in mapped:
-        if os.path.exists(path):
-            clips.append(path)
-            durations.append(per_word)
-            timeline.append({
-                "word": w,
-                "file": os.path.basename(path),
-                "start": current_time,
-                "end": current_time + per_word
-            })
-            current_time += per_word
-
-    if not clips:
-        return None, "<div style='color:red'>No matching sign GIFs found.</div>"
-
-    txtlist = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
-    for clip, dur in zip(clips, durations):
-        txtlist.write(f"file '{os.path.abspath(clip)}'\n")
-        txtlist.write(f"duration {dur}\n")
-    txtlist.close()
-
-    cmd = [ffmpeg_cmd, "-f", "concat", "-safe", "0", "-i", txtlist.name,
-           "-vf", "scale=320:-1,fps=10", "-pix_fmt", "yuv420p", output_path, "-y"]
-    subprocess.run(cmd, check=True)
-
-    # build HTML timeline
-    timeline_json = json.dumps(timeline)
-    html = f"""
-    <style>
-      .word-list span {{padding:4px; margin:2px; display:inline-block; border-radius:6px;}}
-      .active-word {{ background: yellow; font-weight: bold; }}
-    </style>
-    <div class='word-list' id='word-list'></div>
-    <script>
-      const timeline = {timeline_json};
-      const video = document.querySelector("video");
-      const container = document.getElementById("word-list");
-      container.innerHTML = timeline.map((t,i)=>`<span id=word${{i}}>${{t.word}}</span>`).join(" ");
-      if(video){{
-        video.addEventListener("timeupdate", ()=>{{
-          const ct = video.currentTime;
-          timeline.forEach((t,i)=>{{
-            const el = document.getElementById("word"+i);
-            if(ct>=t.start && ct<t.end){{
-              el.classList.add("active-word");
-            }} else {{
-              el.classList.remove("active-word");
-            }}
-          }});
-        }});
-      }}
-    </script>
-    """
-
-    return output_path, html
+        return sigml_file.name, "<div style='color:red'>SigML file generated locally but no hosting available. Set SIGN_BUCKET env var to host.</div>"
 
 
 def transcribe_video(video_path, upload_to_s3=False, bucket_name=None, text_input=""):
     if text_input.strip():
-        sign_video, debug_html = build_sign_video_from_text(text_input)
-        return text_input, None, sign_video, debug_html
+        _, iframe_html = generate_sign_avatar(text_input)
+        return text_input, None, None, iframe_html
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
         audio_path = tmp_audio.name
@@ -192,25 +144,18 @@ def transcribe_video(video_path, upload_to_s3=False, bucket_name=None, text_inpu
         transcription_with_timestamps.append(f"[{start:.2f} - {end:.2f}] {text}")
     transcription_text = "\n".join(transcription_with_timestamps)
 
-    srt_path = tempfile.NamedTemporaryFile(suffix=".srt", delete=False).name
-    save_srt(result, srt_path)
-
     s3_urls = []
     if upload_to_s3 and bucket_name:
         video_filename = os.path.basename(video_path)
-        srt_filename = os.path.splitext(video_filename)[0] + ".srt"
         try:
             s3_client.upload_file(video_path, bucket_name, video_filename)
-            s3_client.upload_file(srt_path, bucket_name, srt_filename)
             s3_urls.append(f"s3://{bucket_name}/{video_filename}")
-            s3_urls.append(f"s3://{bucket_name}/{srt_filename}")
         except Exception:
             pass
 
-    all_text = " ".join([seg["text"] for seg in result["segments"]])
-    sign_video, debug_html = build_sign_video_from_text(all_text, segments=result["segments"])
+    _, iframe_html = generate_sign_avatar(" ".join([seg["text"] for seg in result["segments"]]))
 
-    return transcription_text, "\n".join(s3_urls) if s3_urls else None, sign_video, debug_html
+    return transcription_text, "\n".join(s3_urls) if s3_urls else None, None, iframe_html
 
 
 # Gradio webapp
@@ -220,16 +165,16 @@ demo = gr.Interface(
         gr.Video(label="Upload Video"),
         gr.Checkbox(label="Upload to S3"),
         gr.Textbox(label="S3 Bucket", placeholder="my-bucket"),
-        gr.Textbox(label="Text to Sign (optional)", placeholder="Type text here to generate sign video directly"),
+        gr.Textbox(label="Text to Sign (optional)", placeholder="Type text here to generate sign avatar"),
     ],
     outputs=[
         gr.Textbox(label="Transcription", lines=15),
         gr.Textbox(label="S3 URLs"),
-        gr.Video(label="Sign Language Video"),
-        gr.HTML(label="Live Sign Debug"),
+        gr.Video(label="Original Video"),
+        gr.HTML(label="Sign Language Avatar"),
     ],
-    title="🎙️ Video Transcriber + Live Sign Generator",
-    description="Upload a video or type text to get transcription and a synchronized sign-language video using local GIFs. The debug log highlights each sign word live as the video plays.",
+    title="🎙️ Video Transcriber + Sign Avatar",
+    description="Upload a video or text to get transcription and view a signing avatar generated from gloss using JASigning (via SiGML).",
     theme="default"
 )
 
